@@ -3,15 +3,22 @@
 """封闭池塘两轮抽样标记重捕估算系统（Flask + SQLite）。
 
 规则：
-- 首轮 CSV 登记放回鱼的唯一标记号（1~300 条）。
-- 次轮 CSV 每行：唯一样本号、标记状态（有标/无标/看不清）、来自首轮的候选标记号。
+- 首轮 CSV 登记放回鱼的唯一标记号（1~300 条），可附体长。
+- 次轮 CSV 每行：唯一样本号、标记状态（有标/无标/看不清）、来自首轮的候选标记号，
+  可附体长。
+- 体长列可写 means 毫米（length_mm）或厘米（length_cm）；留空或无此列算未测。
+  两列并存、或非空值无法精确换成正整数毫米时，整份 CSV 拒收。
 - 配对：有标必配、无标不配、看不清可配可不配、每个首轮标记最多用一次。
 - 求可行的最少/最多重捕数并各附一套配对（二分图匹配）。
 - 鱼数估算 N = 首轮条数 × 次轮条数 ÷ 重捕数，重捕数为 0 的端点标为不可估。
-- 次轮记录可按所见版号逐条更正（乐观锁）；过期、无解或写入失败时保留上次记录与估算。
+- 次轮记录可按所见版号逐条更正（乐观锁），体长可按毫米更正或清空；
+  过期、无解或写入失败时保留上次记录与估算。
+- 每次体长数据变化都会归档为一次“已提交调查”，下载的 JSON 只取当次快照，
+  更正或整份重传后旧页仍能下载原数据。
 """
 
 import csv
+import hashlib
 import io
 import json
 import os
@@ -20,8 +27,11 @@ import sqlite3
 import sys
 from collections import deque
 from datetime import datetime, timezone
+from decimal import Decimal
 
-from flask import Flask, flash, redirect, render_template, request, url_for
+from flask import Flask, Response, flash, redirect, render_template, request, url_for
+
+from recompute import analyze_lengths, fraction_text
 
 sys.setrecursionlimit(10000)
 
@@ -40,19 +50,25 @@ TAG_HEADERS = ("tag", "标记号", "标记", "tag_no", "mark", "编号")
 SAMPLE_HEADERS = ("sample_no", "样本号", "sample", "id", "编号")
 STATUS_HEADERS = ("status", "状态", "标记状态")
 CAND_HEADERS = ("candidates", "候选号", "候选标记号", "候选", "cand")
+LENGTH_MM_HEADERS = ("length_mm",)
+LENGTH_CM_HEADERS = ("length_cm",)
 
 SEPARATORS = re.compile(r"[;；|/、，,·\s]+")
 FORBIDDEN_IN_TAG = re.compile(r"[;；|/、，,·\s]")
+INT_MM = re.compile(r"^[0-9]+$")
+DECIMAL_CM = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS round1 (
-    tag TEXT PRIMARY KEY
+    tag TEXT PRIMARY KEY,
+    length_mm INTEGER
 );
 CREATE TABLE IF NOT EXISTS round2 (
     sample_no  TEXT PRIMARY KEY,
     status     TEXT NOT NULL,
     candidates TEXT NOT NULL DEFAULT '[]',
-    version    INTEGER NOT NULL DEFAULT 1
+    version    INTEGER NOT NULL DEFAULT 1,
+    length_mm  INTEGER
 );
 CREATE TABLE IF NOT EXISTS estimate (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
@@ -66,6 +82,20 @@ CREATE TABLE IF NOT EXISTS estimate (
     max_matching TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS survey (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    canonical_seq   INTEGER,
+    length_seq      INTEGER NOT NULL DEFAULT 0,
+    canonical_sha256 TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS submission (
+    seq            INTEGER PRIMARY KEY,
+    payload_sha256 TEXT NOT NULL,
+    payload_json   TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+);
 """
 
 app = Flask(__name__)
@@ -74,6 +104,10 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
 class UploadError(Exception):
     """CSV 内容或更正内容校验失败。"""
+
+
+def now_iso():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 # ---------------------------------------------------------------- 数据库
@@ -85,6 +119,12 @@ def get_db():
     return conn
 
 
+def _ensure_column(conn, table, column, decl):
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_db():
     parent = os.path.dirname(DB_PATH)
     if parent:
@@ -92,6 +132,19 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.executescript(SCHEMA)
+        # 兼容旧版数据库：补齐体长列。
+        _ensure_column(conn, "round1", "length_mm", "INTEGER")
+        _ensure_column(conn, "round2", "length_mm", "INTEGER")
+        row = conn.execute("SELECT id FROM survey WHERE id = 1").fetchone()
+        if row is None:
+            stamp = now_iso()
+            conn.execute(
+                "INSERT INTO survey"
+                " (id, canonical_seq, length_seq, canonical_sha256,"
+                "  created_at, updated_at)"
+                " VALUES (1, NULL, 0, NULL, ?, ?)",
+                (stamp, stamp),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -104,9 +157,29 @@ def load_records(conn):
             "status": r["status"],
             "candidates": json.loads(r["candidates"]),
             "version": r["version"],
+            "length_mm": r["length_mm"],
         }
         for r in conn.execute(
-            "SELECT sample_no, status, candidates, version FROM round2 ORDER BY rowid"
+            "SELECT sample_no, status, candidates, version, length_mm"
+            " FROM round2 ORDER BY rowid"
+        )
+    ]
+
+
+def load_survey(conn):
+    row = conn.execute("SELECT * FROM survey WHERE id = 1").fetchone()
+    return dict(row) if row else None
+
+
+def load_submissions(conn):
+    return [
+        {
+            "seq": r["seq"],
+            "created_at": r["created_at"],
+            "payload": json.loads(r["payload_json"]),
+        }
+        for r in conn.execute(
+            "SELECT seq, created_at, payload_json FROM submission ORDER BY seq DESC"
         )
     ]
 
@@ -114,9 +187,13 @@ def load_records(conn):
 def load_state():
     conn = get_db()
     try:
-        tags = [r[0] for r in conn.execute("SELECT tag FROM round1 ORDER BY rowid")]
+        tags = [
+            {"tag": r["tag"], "length_mm": r["length_mm"]}
+            for r in conn.execute("SELECT tag, length_mm FROM round1 ORDER BY rowid")
+        ]
         records = load_records(conn)
         row = conn.execute("SELECT * FROM estimate WHERE id = 1").fetchone()
+        survey = load_survey(conn)
     finally:
         conn.close()
     est = None
@@ -124,7 +201,7 @@ def load_state():
         est = dict(row)
         est["min_matching"] = json.loads(est["min_matching"])
         est["max_matching"] = json.loads(est["max_matching"])
-    return tags, records, est
+    return tags, records, est, survey
 
 
 def save_estimate(conn, n1, n2, sol):
@@ -144,9 +221,73 @@ def save_estimate(conn, n1, n2, sol):
             est_low,
             json.dumps(sol["min_matching"], ensure_ascii=False),
             json.dumps(sol["max_matching"], ensure_ascii=False),
-            datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            now_iso(),
         ),
     )
+
+
+# ---------------------------------------------------------------- 体长快照
+
+def content_digest(payload):
+    """只对毫米读数与样本数取摘要，用于识别“同号”的整份重传。"""
+    core = {
+        "n1": payload["n1"],
+        "n2": payload["n2"],
+        "round1_lengths": payload["round1_lengths"],
+        "round2_lengths": payload["round2_lengths"],
+    }
+    raw = json.dumps(core, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def build_payload(round1_lengths, round2_lengths):
+    return {
+        "n1": len(round1_lengths),
+        "n2": len(round2_lengths),
+        "round1_lengths": list(round1_lengths),
+        "round2_lengths": list(round2_lengths),
+    }
+
+
+def archive_survey(conn, payload, stamp, survey=None):
+    """归档一次体长快照并设为当前；内容与当前相同则不重复归档。
+
+    返回当前调查编号（seq）。旧编号的原 JSON 永远保持不变。
+    """
+    survey = survey or load_survey(conn)
+    digest = content_digest(payload)
+    if survey["canonical_seq"] is not None and survey["canonical_sha256"] == digest:
+        conn.execute(
+            "UPDATE survey SET updated_at = ? WHERE id = 1", (stamp,)
+        )
+        return survey["canonical_seq"]
+
+    seq = survey["length_seq"] + 1
+    body = dict(payload)
+    body["survey_id"] = seq
+    body["created_at"] = stamp
+    text = json.dumps(body, ensure_ascii=False, sort_keys=True, indent=2)
+    conn.execute(
+        "INSERT INTO submission (seq, payload_sha256, payload_json, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        (seq, digest, text, stamp),
+    )
+    conn.execute(
+        "UPDATE survey SET length_seq = ?, canonical_seq = ?,"
+        " canonical_sha256 = ?, updated_at = ? WHERE id = 1",
+        (seq, seq, digest, stamp),
+    )
+    return seq
+
+
+def lengths_from_rows(conn):
+    round1 = [
+        r[0] for r in conn.execute("SELECT length_mm FROM round1 ORDER BY rowid")
+    ]
+    round2 = [
+        r[0] for r in conn.execute("SELECT length_mm FROM round2 ORDER BY rowid")
+    ]
+    return round1, round2
 
 
 # ---------------------------------------------------------------- 二分图匹配
@@ -297,6 +438,73 @@ def _find_col(header, names):
     return None
 
 
+def _cell(row, index):
+    return row[index].strip() if index is not None and index < len(row) else ""
+
+
+def length_columns(header, where):
+    """定位体长列；两列并存时无法确定单位，整份拒收。"""
+    i_mm = _find_col(header, LENGTH_MM_HEADERS)
+    i_cm = _find_col(header, LENGTH_CM_HEADERS)
+    if i_mm is not None and i_cm is not None:
+        raise UploadError(
+            f"{where} CSV 同时含 length_mm 与 length_cm 两列，单位不唯一，"
+            "整份不予接收。"
+        )
+    return i_mm, i_cm
+
+
+def _positive_mm(mm, raw, where, lineno):
+    if mm <= 0:
+        raise UploadError(
+            f"{where}第 {lineno} 行体长 {raw!r} 不是正整数毫米，整份不予接收。"
+        )
+    return mm
+
+
+def parse_length_cell(row, i_mm, i_cm, where, lineno):
+    """返回整数毫米或 None（未测）；无法精确换算则抛错并拒收整份。"""
+    if i_mm is not None:
+        raw = _cell(row, i_mm)
+        if not raw:
+            return None
+        if not INT_MM.match(raw):
+            raise UploadError(
+                f"{where}第 {lineno} 行体长 {raw!r} 无法精确换成正整数毫米，"
+                "整份不予接收。"
+            )
+        return _positive_mm(int(raw), raw, where, lineno)
+
+    if i_cm is not None:
+        raw = _cell(row, i_cm)
+        if not raw:
+            return None
+        if not DECIMAL_CM.match(raw):
+            raise UploadError(
+                f"{where}第 {lineno} 行体长 {raw!r} 无法精确换成正整数毫米，"
+                "整份不予接收。"
+            )
+        millimeters = Decimal(raw) * 10
+        if millimeters != millimeters.to_integral_value():
+            raise UploadError(
+                f"{where}第 {lineno} 行体长 {raw!r} 厘米无法精确换成正整数毫米，"
+                "整份不予接收。"
+            )
+        return _positive_mm(int(millimeters), raw, where, lineno)
+
+    return None
+
+
+def parse_mm_form(raw, where="该记录"):
+    """网页更正里的体长：空 = 清空；否则必须是正整数毫米。"""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if not INT_MM.match(text):
+        raise UploadError(f"{where}体长 {raw!r} 需为正整数毫米（留空表示未测）。")
+    return _positive_mm(int(text), raw, where, 0)
+
+
 def parse_round1(text):
     rows = _rows(text)
     if not rows:
@@ -304,27 +512,34 @@ def parse_round1(text):
     idx = _find_col(rows[0], TAG_HEADERS)
     if idx is None:
         raise UploadError("首轮 CSV 表头需包含 tag（或：标记号 / 标记 / 编号）。")
-    tags = []
+    i_mm, i_cm = length_columns(rows[0], "首轮")
+    entries = []
     for lineno, row in enumerate(rows[1:], start=2):
-        if idx >= len(row) or not row[idx].strip():
+        tag = _cell(row, idx)
+        if not tag:
             raise UploadError(f"首轮第 {lineno} 行缺少标记号。")
-        tag = row[idx].strip()
         if FORBIDDEN_IN_TAG.search(tag):
             raise UploadError(
                 f"首轮第 {lineno} 行标记号 {tag!r} 含非法字符（空格或 ;；|/、，,）。"
             )
-        tags.append(tag)
-    if not 1 <= len(tags) <= MAX_ROWS:
-        raise UploadError(f"首轮条数须为 1~{MAX_ROWS}，实际 {len(tags)} 条。")
+        entries.append(
+            {
+                "tag": tag,
+                "length_mm": parse_length_cell(row, i_mm, i_cm, "首轮", lineno),
+            }
+        )
+    if not 1 <= len(entries) <= MAX_ROWS:
+        raise UploadError(f"首轮条数须为 1~{MAX_ROWS}，实际 {len(entries)} 条。")
     seen, dups = set(), set()
-    for t in tags:
-        if t in seen:
-            dups.add(t)
-        seen.add(t)
+    for entry in entries:
+        tag = entry["tag"]
+        if tag in seen:
+            dups.add(tag)
+        seen.add(tag)
     if dups:
         sample = "、".join(sorted(dups)[:5])
         raise UploadError(f"首轮标记号不唯一：{sample}{' 等' if len(dups) > 5 else ''}。")
-    return tags
+    return entries
 
 
 def normalize_status(raw, lineno=None):
@@ -368,22 +583,25 @@ def parse_round2(text, tagset):
             "次轮 CSV 表头需包含 sample_no,status,candidates"
             "（或：样本号 / 状态 / 候选号）。"
         )
+    i_mm, i_cm = length_columns(header, "次轮")
     records = []
     seen = set()
     for lineno, row in enumerate(rows[1:], start=2):
-        def cell(i):
-            return row[i].strip() if i < len(row) else ""
-
-        sample_no = cell(i_no)
+        sample_no = _cell(row, i_no)
         if not sample_no:
             raise UploadError(f"次轮第 {lineno} 行缺少样本号。")
         if sample_no in seen:
             raise UploadError(f"次轮样本号重复：{sample_no}。")
         seen.add(sample_no)
-        status = normalize_status(cell(i_st), lineno)
-        cands = validate_candidates(cell(i_ca), tagset, status, lineno)
+        status = normalize_status(_cell(row, i_st), lineno)
+        cands = validate_candidates(_cell(row, i_ca), tagset, status, lineno)
         records.append(
-            {"sample_no": sample_no, "status": status, "candidates": cands}
+            {
+                "sample_no": sample_no,
+                "status": status,
+                "candidates": cands,
+                "length_mm": parse_length_cell(row, i_mm, i_cm, "次轮", lineno),
+            }
         )
     if not 1 <= len(records) <= MAX_ROWS:
         raise UploadError(f"次轮条数须为 1~{MAX_ROWS}，实际 {len(records)} 条。")
@@ -393,12 +611,13 @@ def parse_round2(text, tagset):
 # ---------------------------------------------------------------- 页面
 
 def render_index(**extra):
-    tags, records, est = load_state()
+    tags, records, est, survey = load_state()
     return render_template(
         "index.html",
         tags=tags,
         records=records,
         est=est,
+        survey=survey,
         statuses=STATUSES,
         **extra,
     )
@@ -416,8 +635,10 @@ def upload():
         f2 = request.files.get("round2_file")
         if f1 is None or f2 is None or not f1.filename or not f2.filename:
             raise UploadError("请同时选择首轮与次轮两个 CSV 文件。")
-        tags = parse_round1(read_text_upload(f1))
-        records = parse_round2(read_text_upload(f2), set(tags))
+        entries = parse_round1(read_text_upload(f1))
+        records = parse_round2(
+            read_text_upload(f2), {entry["tag"] for entry in entries}
+        )
         sol = compute_solution(records)
     except UploadError as exc:
         return render_index(error=str(exc)), 400
@@ -434,25 +655,35 @@ def upload():
     try:
         conn = get_db()
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
+            stamp = now_iso()
+            survey = load_survey(conn)
             conn.execute("DELETE FROM round1")
             conn.execute("DELETE FROM round2")
             conn.executemany(
-                "INSERT INTO round1(tag) VALUES (?)", [(t,) for t in tags]
+                "INSERT INTO round1(tag, length_mm) VALUES (?, ?)",
+                [(entry["tag"], entry["length_mm"]) for entry in entries],
             )
             conn.executemany(
-                "INSERT INTO round2(sample_no, status, candidates, version)"
-                " VALUES (?, ?, ?, 1)",
+                "INSERT INTO round2"
+                " (sample_no, status, candidates, version, length_mm)"
+                " VALUES (?, ?, ?, 1, ?)",
                 [
                     (
                         r["sample_no"],
                         r["status"],
                         json.dumps(r["candidates"], ensure_ascii=False),
+                        r["length_mm"],
                     )
                     for r in records
                 ],
             )
-            save_estimate(conn, len(tags), len(records), sol)
+            save_estimate(conn, len(entries), len(records), sol)
+            payload = build_payload(
+                [entry["length_mm"] for entry in entries],
+                [r["length_mm"] for r in records],
+            )
+            archive_survey(conn, payload, stamp, survey)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -473,6 +704,8 @@ def correct():
     version_seen = (request.form.get("version") or "").strip()
     status_raw = request.form.get("status") or ""
     cand_raw = request.form.get("candidates") or ""
+    length_raw = request.form.get("length_mm")
+    length_submitted = length_raw is not None
 
     conn = get_db()
     try:
@@ -500,6 +733,11 @@ def correct():
             status = normalize_status(status_raw)
             tags = [r[0] for r in conn.execute("SELECT tag FROM round1")]
             cands = validate_candidates(cand_raw, set(tags), status)
+            length_mm = (
+                parse_mm_form(length_raw, f"记录 {sample_no} ")
+                if length_submitted
+                else row["length_mm"]
+            )
         except UploadError as exc:
             return render_index(error=str(exc)), 400
 
@@ -508,6 +746,7 @@ def correct():
             if r["sample_no"] == sample_no:
                 r["status"] = status
                 r["candidates"] = cands
+                r["length_mm"] = length_mm
         sol = compute_solution(records)
         if not sol["feasible"]:
             return (
@@ -519,14 +758,17 @@ def correct():
             )
 
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
+            stamp = now_iso()
+            survey = load_survey(conn)
             cur = conn.execute(
                 "UPDATE round2 SET status = ?, candidates = ?,"
-                " version = version + 1"
+                " length_mm = ?, version = version + 1"
                 " WHERE sample_no = ? AND version = ?",
                 (
                     status,
                     json.dumps(cands, ensure_ascii=False),
+                    length_mm,
                     sample_no,
                     row["version"],
                 ),
@@ -541,6 +783,13 @@ def correct():
                     409,
                 )
             save_estimate(conn, len(tags), len(records), sol)
+            round1_lengths, round2_lengths = lengths_from_rows(conn)
+            archive_survey(
+                conn,
+                build_payload(round1_lengths, round2_lengths),
+                stamp,
+                survey,
+            )
             conn.commit()
         except sqlite3.Error:
             conn.rollback()
@@ -556,6 +805,104 @@ def correct():
         "ok",
     )
     return redirect(url_for("index"))
+
+
+@app.route("/compare")
+def compare():
+    conn = get_db()
+    try:
+        survey = load_survey(conn)
+        submissions = load_submissions(conn)
+    finally:
+        conn.close()
+
+    if not survey or survey["canonical_seq"] is None or not submissions:
+        return (
+            render_template(
+                "compare.html",
+                error="尚无已提交调查，请先上传两轮 CSV 后再比较体长。",
+                submissions=[],
+            ),
+            400,
+        )
+
+    current = next(
+        (s for s in submissions if s["seq"] == survey["canonical_seq"]), None
+    )
+    if current is None:
+        return (
+            render_template(
+                "compare.html",
+                error="当前调查快照缺失，请重新上传两轮 CSV。",
+                submissions=submissions,
+            ),
+            500,
+        )
+
+    payload = current["payload"]
+    result = analyze_lengths(
+        payload["round1_lengths"], payload["round2_lengths"]
+    )
+    return render_template(
+        "compare.html",
+        error=None,
+        survey_id=current["seq"],
+        created_at=current["created_at"],
+        n1=payload["n1"],
+        n2=payload["n2"],
+        result=result,
+        submissions=submissions,
+        current_seq=current["seq"],
+    )
+
+
+def _download_submission(seq):
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT seq, payload_json FROM submission WHERE seq = ?", (seq,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return Response(
+            f"没有编号为 {seq} 的体长提交。\n",
+            status=404,
+            mimetype="text/plain; charset=utf-8",
+        )
+    return Response(
+        row["payload_json"],
+        mimetype="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="lengths-{seq}.json"'
+        },
+    )
+
+
+@app.route("/lengths/current.json")
+def download_current_lengths():
+    conn = get_db()
+    try:
+        survey = load_survey(conn)
+    finally:
+        conn.close()
+    if not survey or survey["canonical_seq"] is None:
+        return Response(
+            "尚无已提交调查。\n",
+            status=404,
+            mimetype="text/plain; charset=utf-8",
+        )
+    return _download_submission(survey["canonical_seq"])
+
+
+@app.route("/lengths/<int:seq>.json")
+def download_lengths(seq):
+    return _download_submission(seq)
+
+
+@app.template_filter("frac")
+def _frac_filter(value):
+    return fraction_text(value)
 
 
 init_db()

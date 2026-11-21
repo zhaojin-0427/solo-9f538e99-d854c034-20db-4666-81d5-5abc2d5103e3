@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>体长对照</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+         margin: 0 auto; max-width: 1080px; padding: 16px 24px 64px; color: #1f2933; }
+  h1 { font-size: 1.5rem; } h2 { font-size: 1.15rem; margin-bottom: 8px; }
+  section { border: 1px solid #d9e2ec; border-radius: 8px;
+            padding: 16px 20px; margin: 16px 0; background: #fff; }
+  table { border-collapse: collapse; margin: 8px 0; width: 100%; }
+  th, td { border: 1px solid #d9e2ec; padding: 5px 10px; font-size: .9rem;
+           text-align: left; }
+  th { background: #f0f4f8; }
+  .msg { border-radius: 6px; padding: 10px 14px; margin: 10px 0; font-size: .95rem; }
+  .msg.error { background: #fdecea; border: 1px solid #f0a9a0; }
+  .big { font-size: 1.15rem; font-weight: 700; }
+  .frac { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .hint { color: #627d98; font-size: .85rem; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; }
+  dt { color: #334e68; } dd { margin: 0; }
+  a { color: #2563a8; }
+</style>
+</head>
+<body>
+<h1>两轮抽样 · 体长对照</h1>
+<p class="hint">数据来自同一次已提交调查（编号 <b>{{ survey_id if survey_id is not none else '—' }}</b>）。
+比较的是两轮实测体长的累计分布：体长不超过某值时各轮其所占比例。</p>
+
+{% if error %}<div class="msg error">{{ error }}</div>{% endif %}
+
+{% if error is none %}
+<section>
+  <h2>1. 样本与缺测</h2>
+  {% if result.missing_counts[0] or result.missing_counts[1] %}
+  <p class="big">首轮缺测 {{ result.missing_counts[0] }} 条；次轮缺测 {{ result.missing_counts[1] }} 条。</p>
+  <p class="hint">两轮体长齐全后才作累计比例比较与重分组检验；补齐或清空缺测后重新提交即可比较。</p>
+  {% else %}
+  <dl>
+    <dt>首轮样本数</dt><dd>{{ n1 }} 条（全部实测）</dd>
+    <dt>次轮样本数</dt><dd>{{ n2 }} 条（全部实测）</dd>
+  </dl>
+  {% endif %}
+</section>
+
+{% if result.analysis %}
+  {% set item = result.analysis %}
+  <section>
+    <h2>2. 实测累计比例的最大绝对差</h2>
+    {% if item.abs_diff == '0/1' %}
+    <p>两轮累计比例处处相同，最大绝对差为 0。</p>
+    {% endif %}
+    <dl>
+      <dt>体长（并列取最小）</dt><dd class="big">{{ item.at_length_mm }} mm</dd>
+      <dt>首轮不超过该值的条数</dt><dd>{{ item.round1_at_or_below }} / {{ n1 }}</dd>
+      <dt>首轮累计比例</dt><dd class="big frac">{{ item.p1 }}</dd>
+      <dt>次轮不超过该值的条数</dt><dd>{{ item.round2_at_or_below }} / {{ n2 }}</dd>
+      <dt>次轮累计比例</dt><dd class="big frac">{{ item.p2 }}</dd>
+      <dt>两轮比例之差（首轮减次轮）</dt><dd class="big frac">{{ item.diff }}</dd>
+      <dt>绝对差</dt><dd class="big frac">{{ item.abs_diff }}</dd>
+    </dl>
+  </section>
+
+  <section>
+    <h2>3. 重分组检验</h2>
+    <p>保持首轮 {{ n1 }} 条、次轮 {{ n2 }} 条不变，所有等可能的重分组共
+       <span class="frac">{{ item.permutation.total }}</span> 种；其中最大绝对差不小于
+       实测值的占：</p>
+    <p class="big frac">{{ item.permutation.fraction }}</p>
+    <p class="hint">= {{ item.permutation.favorable }} / {{ item.permutation.total }}
+       （等长记录各计一条，整组安排完才比较，不逐套枚举）。</p>
+    <p><a href="{{ url_for('download_lengths', seq=survey_id) }}">下载当次两轮毫米读数 JSON</a>
+       <span class="hint">（缺测写 null；用独立脚本离线复算：
+       <code>python recompute.py lengths-{{ survey_id }}.json</code>）</span></p>
+  </section>
+{% endif %}
+{% endif %}
+
+{% if submissions %}
+<section>
+  <h2>历史体长提交</h2>
+  <p class="hint">每次更正或整份重传都会归档一次；旧编号的 JSON 保持原样，可随时下载复算。</p>
+  <table>
+    <tr><th>编号</th><th>提交时间</th><th>首轮 / 次轮条数</th><th>下载</th></tr>
+    {% for s in submissions %}
+    <tr>
+      <td>{{ s.seq }}{% if s.seq == current_seq %}（当前）{% endif %}</td>
+      <td>{{ s.created_at }}</td>
+      <td>{{ s.payload.n1 }} / {{ s.payload.n2 }}</td>
+      <td><a href="{{ url_for('download_lengths', seq=s.seq) }}">lengths-{{ s.seq }}.json</a></td>
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+{% endif %}
+
+<p><a href="{{ url_for('index') }}">← 返回首页</a></p>
+</body>
+</html>

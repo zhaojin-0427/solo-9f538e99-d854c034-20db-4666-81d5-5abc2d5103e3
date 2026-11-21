@@ -24,6 +24,7 @@
   .na { color: #b3261e; font-weight: 700; }
   form.inline { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
   input[type=text] { width: 180px; padding: 4px 6px; }
+  input[type=text].len { width: 150px; }
   select, button { padding: 4px 8px; }
   button { cursor: pointer; border: 1px solid #9fb3c8; border-radius: 5px;
            background: #f0f4f8; }
@@ -69,13 +70,21 @@
 <section>
   <h2>1. 上传两轮抽样 CSV</h2>
   <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
-    <label class="file">首轮 CSV（表头 <code>tag</code>，每行一个唯一标记号，1~300 条）：
+    <label class="file">首轮 CSV（表头 <code>tag</code>，每行一个唯一标记号，1~300 条；
+      可再加体长列）：
       <input type="file" name="round1_file" accept=".csv" required></label>
     <label class="file">次轮 CSV（表头 <code>sample_no,status,candidates</code>；状态填
-      有标/无标/看不清；候选号来自首轮、用 ; 分隔，1~300 条）：
+      有标/无标/看不清；候选号来自首轮、用 ; 分隔；可再加体长列，1~300 条）：
       <input type="file" name="round2_file" accept=".csv" required></label>
+    <p class="hint">体长列可写 <code>length_mm</code>（整数毫米）或 <code>length_cm</code>
+      （厘米），两者只能有一个；整格留空或无此列算未测。两列并存、或非空值无法精确
+      换成正整数毫米时，整份 CSV 拒收。</p>
     <button type="submit">上传并估算</button>
-    <span class="hint">上传将整体替换现有数据；若无解或写入失败，自动保留上次记录与估算。</span>
+    <span class="hint">上传将整体替换现有数据；若无解、格式有误或写入失败，自动保留上次记录与估算。</span>
+  </form>
+  <form method="get" action="{{ url_for('compare') }}" style="margin-top:10px">
+    <button type="submit">比较体长</button>
+    <span class="hint">用当前已提交调查的两轮记录比较累计体长分布。</span>
   </form>
 </section>
 
@@ -133,20 +142,28 @@
 <section><h2>2. 当前估算</h2><p>暂无估算，请先上传两轮 CSV。</p></section>
 {% endif %}
 
+{% if survey and survey.canonical_seq %}
+<p class="hint">体长快照：当前为第 <b>{{ survey.canonical_seq }}</b> 次提交，
+   <a href="{{ url_for('download_lengths', seq=survey.canonical_seq) }}">下载本次毫米读数 JSON</a>。</p>
+{% endif %}
+
 {% if records %}
 <section>
   <h2>3. 次轮记录（共 {{ records | length }} 条）与逐条更正</h2>
   <p class="hint">每条记录按<b>所见版号</b>提交更正；若提交时版号已变化（过期）、
-     更正后无解或写入失败，本次更正不生效，保留上次记录与估算。</p>
+     更正后无解或写入失败，本次更正不生效，保留上次记录与估算。
+     体长按毫米更正，留空即清空（未测）。提交体长只需填以下表单的体长框。</p>
   <table>
     <tr>
-      <th>样本号</th><th>状态</th><th>候选标记号</th><th>版号</th><th>更正为</th>
+      <th>样本号</th><th>状态</th><th>候选标记号</th><th>体长 (mm)</th>
+      <th>版号</th><th>更正为</th>
     </tr>
     {% for r in records %}
     <tr>
       <td>{{ r.sample_no }}</td>
       <td>{{ r.status }}</td>
       <td>{{ r.candidates | join('、') if r.candidates else '—' }}</td>
+      <td>{{ r.length_mm if r.length_mm is not none else '未测' }}</td>
       <td class="ver">{{ r.version }}</td>
       <td>
         <form class="inline" method="post" action="{{ url_for('correct') }}">
@@ -159,6 +176,9 @@
           </select>
           <input type="text" name="candidates"
                  value="{{ r.candidates | join(';') }}" placeholder="候选号，;分隔">
+          <input type="text" name="length_mm" class="len"
+                 value="{{ r.length_mm if r.length_mm is not none else '' }}"
+                 placeholder="体长 mm，留空=未测">
           <button type="submit">更正</button>
         </form>
       </td>
@@ -171,7 +191,15 @@
 {% if tags %}
 <details>
   <summary>首轮标记号（共 {{ tags | length }} 个）</summary>
-  <p>{{ tags | join('、') }}</p>
+  <table>
+    <tr><th>标记号</th><th>体长 (mm)</th></tr>
+    {% for t in tags %}
+    <tr>
+      <td>{{ t.tag }}</td>
+      <td>{{ t.length_mm if t.length_mm is not none else '未测' }}</td>
+    </tr>
+    {% endfor %}
+  </table>
 </details>
 {% endif %}
 
